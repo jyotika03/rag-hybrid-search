@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Project 6 - Hybrid Search RAG. ECS Fargate API behind an ALB, backed by
+  Amazon OpenSearch Service. Includes VPC, ECR, Secrets Manager, IAM and logs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: rag-hybrid-search
+  ContainerImage:
+    Type: String
+    Description: ECR image URI for the API (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/rag-hybrid-search:latest)
+  DesiredCount:
+    Type: Number
+    Default: 2
+  ApiCpu:
+    Type: String
+    Default: "1024"
+  ApiMemory:
+    Type: String
+    Default: "2048"
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+  OpenSearchVolumeGb:
+    Type: Number
+    Default: 20
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+
+Mappings:
+  Cidr:
+    Vpc: { Range: "10.20.0.0/16" }
+    PublicA: { Range: "10.20.0.0/24" }
+    PublicB: { Range: "10.20.1.0/24" }
+    PrivateA: { Range: "10.20.10.0/24" }
+    PrivateB: { Range: "10.20.11.0/24" }
+
+Resources:
+  # ---------------- Networking ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Cidr, Vpc, Range]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, PublicA, Range]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, PublicB, Range]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, PrivateA, Range]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-a" }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, PrivateB, Range]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetA }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetB }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetA }
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetB }
+
+  # ---------------- Security groups ----------------
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: "0.0.0.0/0" }
+  ServiceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSg }
+  OpenSearchSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: OpenSearch access from the service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref ServiceSg }
+
+  # ---------------- Secrets ----------------
+  ApiSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/api-keys"
+      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenAIApiKey}","ANTHROPIC_API_KEY":"${AnthropicApiKey}"}'
+
+  # ---------------- ECR ----------------
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageScanningConfiguration: { ScanOnPush: true }
+
+  # ---------------- OpenSearch ----------------
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub "${ProjectName}-os"
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 2
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig: { AvailabilityZoneCount: 2 }
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref OpenSearchVolumeGb
+      VPCOptions:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref OpenSearchSg]
+      EncryptionAtRestOptions: { Enabled: true }
+      NodeToNodeEncryptionOptions: { Enabled: true }
+      DomainEndpointOptions: { EnforceHTTPS: true }
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !GetAtt TaskRole.Arn }
+            Action: "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-os/*"
+
+  # ---------------- IAM ----------------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["secretsmanager:GetSecretValue"]
+                Resource: !Ref ApiSecrets
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: opensearch-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["es:ESHttp*"]
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-os/*"
+
+  # ---------------- Logs ----------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 14
+
+  # ---------------- ECS ----------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+
+  TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-api"
+      Cpu: !Ref ApiCpu
+      Memory: !Ref ApiMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ContainerImage
+          PortMappings: [{ ContainerPort: 8000 }]
+          Environment:
+            - { Name: OPENSEARCH_HOST, Value: !GetAtt OpenSearchDomain.DomainEndpoint }
+            - { Name: OPENSEARCH_PORT, Value: "443" }
+            - { Name: OPENSEARCH_USE_SSL, Value: "true" }
+            - { Name: OPENSEARCH_VERIFY_CERTS, Value: "true" }
+            - { Name: OPENSEARCH_AWS_AUTH, Value: "true" }
+            - { Name: AWS_REGION, Value: !Ref "AWS::Region" }
+            - { Name: OPENSEARCH_INDEX, Value: rag-chunks }
+          Secrets:
+            - { Name: OPENAI_API_KEY, ValueFrom: !Sub "${ApiSecrets}:OPENAI_API_KEY::" }
+            - { Name: ANTHROPIC_API_KEY, ValueFrom: !Sub "${ApiSecrets}:ANTHROPIC_API_KEY::" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: api
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSg]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      Matcher: { HttpCode: "200" }
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      ServiceName: !Sub "${ProjectName}-api"
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref ServiceSg]
+      LoadBalancers:
+        - { ContainerName: api, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup }
+
+Outputs:
+  ApiUrl:
+    Description: Public API endpoint
+    Value: !Sub "http://${Alb.DNSName}"
+  EcrRepoUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+  OpenSearchEndpoint:
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint

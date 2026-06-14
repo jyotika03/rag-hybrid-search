@@ -1,0 +1,7 @@
+[
+  {"id": "q1", "type": "lookup", "question": "What port does the API service listen on by default?", "expected": "Port 8000.", "expected_docs": ["api-reference.md"]},
+  {"id": "q2", "type": "lookup", "question": "Which embedding model is used to index chunks?", "expected": "text-embedding-3-small.", "expected_docs": ["architecture.md"]},
+  {"id": "q3", "type": "multi-hop", "question": "How does the system avoid returning duplicate content and what threshold does it use?", "expected": "It runs near-duplicate detection before indexing and skips chunks with cosine similarity above 0.95.", "expected_docs": ["architecture.md", "ingestion.md"]},
+  {"id": "q4", "type": "no-answer", "question": "What is the company's holiday schedule for 2027?", "expected": "Not answerable from the corpus.", "expected_docs": []},
+  {"id": "q5", "type": "ambiguous", "question": "How do I tune it?", "expected": "Ambiguous; clarify what to tune (retrieval weights, chunk size, thresholds).", "expected_docs": ["configuration.md"]}
+]

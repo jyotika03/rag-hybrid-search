@@ -1,0 +1,6 @@
+[
+  { "ParameterKey": "ContainerImage", "ParameterValue": "<acct>.dkr.ecr.us-east-1.amazonaws.com/rag-hybrid-search:latest" },
+  { "ParameterKey": "OpenAIApiKey", "ParameterValue": "sk-..." },
+  { "ParameterKey": "AnthropicApiKey", "ParameterValue": "sk-ant-..." },
+  { "ParameterKey": "DesiredCount", "ParameterValue": "2" }
+]
